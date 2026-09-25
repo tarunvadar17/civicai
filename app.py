@@ -106,19 +106,35 @@ SERVICES = [
     },
 ]
 
-SYSTEM_PROMPT = """You are CivicAI, a friendly AI assistant that helps citizens understand \
-public services, eligibility, required documents, and application steps.
+SYSTEM_PROMPT = """You are CivicAI, a professional AI assistant for Indian public services.
 
-Use the following service knowledge base whenever it is relevant to the user's question:
+Your job is to understand the citizen's question and give a useful, accurate, easy-to-follow answer.
+
+SERVICE KNOWLEDGE:
 {context}
 
-Guidelines:
-- Answer clearly and concisely, using short structured points where helpful.
-- If the question matches a known service above, base your answer on it.
-- If it doesn't match anything in the knowledge base, answer helpfully using general \
-knowledge about Indian public services, but say the details may vary.
-- Always end by reminding the user to verify current requirements on the relevant \
-official government portal, since rules can change.
+IMPORTANT BEHAVIOR:
+1. Directly answer the user's question first. Do not start with unnecessary greetings.
+2. If the question matches a service in the knowledge base, use that service information as the primary source.
+3. Give practical steps, eligibility, documents, fees/portal guidance only when supported by the knowledge base or clearly identified as general guidance.
+4. If the question is ambiguous, ask ONE short clarifying question rather than guessing.
+5. If the question is outside the knowledge base, still try to help using general knowledge, but clearly say when requirements can vary by state or scheme.
+6. Never invent government portals, eligibility limits, fees, deadlines, documents, or application statuses.
+7. Keep answers concise but complete. Use headings and numbered steps when useful.
+8. For application questions, prefer this structure when applicable:
+   - Answer
+   - Eligibility
+   - Documents
+   - Steps
+   - Important note
+9. Remember the conversation context supplied below and use it naturally.
+10. Always recommend verifying changing requirements on the relevant official government portal.
+
+CONVERSATION:
+{history}
+
+USER QUESTION:
+{message}
 """
 
 
@@ -134,37 +150,128 @@ def build_context():
     return "\n".join(lines)
 
 
-def fallback_answer(user_message):
+def find_relevant_services(user_message):
     msg = user_message.lower()
+    scored = []
+
     for s in SERVICES:
-        if s["name"].lower() in msg or any(k in msg for k in s.get("keywords", [])):
-            steps_text = "\n".join(f"{i+1}. {step}" for i, step in enumerate(s["steps"]))
+        score = 0
+        name = s["name"].lower()
+
+        if name in msg:
+            score += 10
+
+        for keyword in s.get("keywords", []):
+            if keyword.lower() in msg:
+                score += 3
+
+        for word in re.findall(r"[a-z0-9]+", name):
+            if len(word) > 3 and word in msg:
+                score += 1
+
+        if score:
+            scored.append((score, s))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [s for _, s in scored[:3]]
+
+
+def fallback_answer(user_message):
+    relevant = find_relevant_services(user_message)
+
+    if relevant:
+        s = relevant[0]
+        msg = user_message.lower()
+
+        if any(x in msg for x in ["document", "documents", "proof", "need"]):
             return (
-                f"{s['name']} ({s['code']})\n\n{s['description']}\n\n"
-                f"Eligibility: {s['eligibility']}\n\n"
-                f"Documents needed: {', '.join(s['documents'])}\n\n"
-                f"Steps:\n{steps_text}\n\n"
-                f"Please verify current details on the relevant official government portal."
+                f"## {s['name']}\n\n"
+                f"**Documents you may need:**\n"
+                + "\n".join(f"- {d}" for d in s["documents"])
+                + "\n\nPlease verify the current document requirements on the relevant official government portal."
             )
-    categories = sorted(set(s["category"] for s in SERVICES))
+
+        if any(x in msg for x in ["eligible", "eligibility", "qualify", "qualification"]):
+            return (
+                f"## {s['name']}\n\n"
+                f"**Eligibility:** {s['eligibility']}\n\n"
+                "Eligibility rules can vary by scheme or state, so verify the current requirements on the relevant official government portal."
+            )
+
+        return (
+            f"## {s['name']}\n\n"
+            f"{s['description']}\n\n"
+            f"**Eligibility:** {s['eligibility']}\n\n"
+            "**Documents:**\n"
+            + "\n".join(f"- {d}" for d in s["documents"])
+            + "\n\n**Steps:**\n"
+            + "\n".join(f"{i+1}. {step}" for i, step in enumerate(s["steps"]))
+            + "\n\nPlease verify current requirements on the relevant official government portal."
+        )
+
+    categories = ", ".join(sorted(set(s["category"] for s in SERVICES)))
     return (
-        "I can help with information about: " + ", ".join(categories) +
-        ". Could you tell me which service you're interested in, or ask a specific question "
-        "like 'What documents do I need for a scholarship?'"
+        "I can help you with Indian public-service information such as "
+        f"{categories}.\n\n"
+        "Please tell me what you need help with. For example:\n"
+        "• How do I apply for a scholarship?\n"
+        "• What documents are needed for an income certificate?\n"
+        "• How can I check healthcare scheme eligibility?"
     )
 
 
-def ask_gemini(user_message):
+def format_history(history):
+    if not isinstance(history, list):
+        return "No previous conversation."
+
+    recent = history[-8:]
+    lines = []
+
+    for item in recent:
+        if not isinstance(item, dict):
+            continue
+
+        role = item.get("role", "user")
+        text = str(item.get("text", "")).strip()
+
+        if text:
+            speaker = "Citizen" if role == "user" else "CivicAI"
+            lines.append(f"{speaker}: {text}")
+
+    return "\n".join(lines) if lines else "No previous conversation."
+
+
+def ask_gemini(user_message, history=None):
     if not GEMINI_API_KEY:
         return fallback_answer(user_message)
+
     try:
         from google import genai
+
         client = genai.Client(api_key=GEMINI_API_KEY)
-        prompt = SYSTEM_PROMPT.format(context=build_context()) + f"\n\nUser question: {user_message}"
-        response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+
+        prompt = SYSTEM_PROMPT.format(
+            context=build_context(),
+            history=format_history(history),
+            message=user_message
+        )
+
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt
+        )
+
         text = getattr(response, "text", None)
-        return text.strip() if text else fallback_answer(user_message)
-    except Exception:
+
+        if text and text.strip():
+            return text.strip()
+
+        return fallback_answer(user_message)
+
+    except Exception as exc:
+        # Keep the application usable even if the AI service is unavailable.
+        print(f"Gemini error: {type(exc).__name__}: {exc}")
         return fallback_answer(user_message)
 
 
@@ -430,6 +537,15 @@ body{
 .msg.user{align-self:flex-end;background:var(--gradient);color:white;border-bottom-right-radius:4px}
 .msg.bot{align-self:flex-start;background:#14101e;border:1px solid var(--border);color:#ddd7e5;border-bottom-left-radius:4px}
 .msg.loading{background:transparent;border:0;color:#766d80;font-style:italic}
+.msg.bot h3,.msg.bot h4{margin:0 0 7px;color:#f4efff;font-size:11px}
+.msg.bot h4{font-size:10px}
+.msg.bot ul{margin:6px 0 8px;padding-left:17px}
+.msg.bot li{margin:3px 0}
+.typing span{display:inline-block;animation:blink 1.1s infinite}
+.typing span:nth-child(2){animation-delay:.18s}
+.typing span:nth-child(3){animation-delay:.36s}
+@keyframes blink{0%,60%,100%{opacity:.25}30%{opacity:1}}
+
 .chat-dock{padding:10px 8% 4px}
 .chat-dock .ask-box{width:100%;max-width:none}
 
@@ -679,6 +795,7 @@ const views = {
 };
 
 const navButtons = document.querySelectorAll("#main-nav button");
+let conversation = [];
 
 function showView(name){
   Object.values(views).forEach(v => v.classList.remove("active"));
@@ -690,6 +807,7 @@ navButtons.forEach(btn => btn.addEventListener("click", () => showView(btn.datas
 
 const categories = [...new Set(SERVICES.map(s => s.category))];
 const catNav = document.getElementById("cat-nav");
+
 categories.forEach(cat => {
   const li = document.createElement("li");
   const btn = document.createElement("button");
@@ -703,9 +821,21 @@ document.getElementById("service-count").textContent = SERVICES.length;
 document.getElementById("category-count").textContent = categories.length;
 
 const QUICK = [
-  {title:"Scholarships", sub:"How do I apply for a scholarship?", q:"How do I apply for a scholarship?"},
-  {title:"Income Certificate", sub:"What documents are needed?", q:"What documents do I need for an income certificate?"},
-  {title:"Healthcare Schemes", sub:"How can I check eligibility?", q:"How do I check eligibility for healthcare schemes?"}
+  {
+    title:"Scholarships",
+    sub:"How do I apply for a scholarship?",
+    q:"How do I apply for a scholarship?"
+  },
+  {
+    title:"Income Certificate",
+    sub:"What documents are needed?",
+    q:"What documents do I need for an income certificate?"
+  },
+  {
+    title:"Healthcare Schemes",
+    sub:"How can I check eligibility?",
+    q:"How do I check eligibility for healthcare schemes?"
+  }
 ];
 
 const quickGrid = document.getElementById("quick-grid");
@@ -729,6 +859,16 @@ const serviceGrid = document.getElementById("service-grid");
 
 function renderServices(list){
   serviceGrid.innerHTML = "";
+
+  if(!list.length){
+    serviceGrid.innerHTML = `
+      <div class="card" style="grid-column:1/-1">
+        <div class="card-icon">⌕</div>
+        <div class="metric-label">No matching service found.</div>
+      </div>`;
+    return;
+  }
+
   list.forEach(s => {
     const card = document.createElement("div");
     card.className = "service-card";
@@ -748,13 +888,15 @@ function renderServices(list){
     `;
 
     card.querySelector(".service-head").onclick = () => card.classList.toggle("open");
-    card.querySelector(".ask-service").onclick = (e) => {
+    card.querySelector(".ask-service").onclick = e => {
       e.stopPropagation();
       goToAssistantWith(`Tell me more about ${s.name}`);
     };
+
     serviceGrid.appendChild(card);
   });
 }
+
 renderServices(SERVICES);
 
 const emptyState = document.getElementById("empty-state");
@@ -770,35 +912,122 @@ function enterChat(){
   chatLayout.classList.remove("hidden");
 }
 
-function appendMessage(text, sender){
+function escapeHTML(value){
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/* Converts safe, limited markdown-style output into readable UI. */
+function formatBotText(text){
+  let html = escapeHTML(text);
+
+  html = html.replace(/^### (.*)$/gm, "<h4>$1</h4>");
+  html = html.replace(/^## (.*)$/gm, "<h3>$1</h3>");
+  html = html.replace(/^# (.*)$/gm, "<h3>$1</h3>");
+  html = html.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/^\s*[-•]\s+(.*)$/gm, "<li>$1</li>");
+  html = html.replace(/(<li>.*<\/li>\n?)+/g, match => `<ul>${match}</ul>`);
+  html = html.replace(/^\s*(\d+)\.\s+(.*)$/gm, "<li>$2</li>");
+  html = html.replace(/\n{2,}/g, "<br><br>");
+  html = html.replace(/\n/g, "<br>");
+
+  return html;
+}
+
+function appendUserMessage(text){
   const msg = document.createElement("div");
-  msg.className = `msg ${sender}`;
+  msg.className = "msg user";
   msg.textContent = text;
   chatWindow.appendChild(msg);
   chatWindow.scrollTop = chatWindow.scrollHeight;
   return msg;
 }
 
+function appendBotMessage(text){
+  const msg = document.createElement("div");
+  msg.className = "msg bot";
+  msg.innerHTML = formatBotText(text);
+  chatWindow.appendChild(msg);
+  chatWindow.scrollTop = chatWindow.scrollHeight;
+  return msg;
+}
+
+function appendLoading(){
+  const msg = document.createElement("div");
+  msg.className = "msg loading";
+  msg.innerHTML = `<span class="typing">CivicAI is thinking<span>.</span><span>.</span><span>.</span></span>`;
+  chatWindow.appendChild(msg);
+  chatWindow.scrollTop = chatWindow.scrollHeight;
+  return msg;
+}
+
+function setSendState(disabled){
+  askSend.disabled = disabled;
+  chatSend.disabled = disabled;
+  askSend.style.opacity = disabled ? ".5" : "1";
+  chatSend.style.opacity = disabled ? ".5" : "1";
+}
+
 async function sendMessage(message){
-  if(!message || !message.trim()) return;
+  message = (message || "").trim();
+  if(!message) return;
+
   showView("assistant");
   enterChat();
 
-  appendMessage(message, "user");
-  const loading = appendMessage("CivicAI is thinking...", "loading");
+  appendUserMessage(message);
+
+  conversation.push({
+    role:"user",
+    text:message
+  });
+
+  const loading = appendLoading();
+  setSendState(true);
 
   try{
     const res = await fetch("/api/chat", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({message})
+      body:JSON.stringify({
+        message:message,
+        history:conversation.slice(-8)
+      })
     });
+
     const data = await res.json();
+
     loading.remove();
-    appendMessage(data.response || "Sorry, something went wrong. Please try again.", "bot");
+
+    if(!res.ok){
+      throw new Error(data.error || "Request failed");
+    }
+
+    const answer = data.response || "I couldn't generate an answer. Please try again.";
+    appendBotMessage(answer);
+
+    conversation.push({
+      role:"assistant",
+      text:answer
+    });
+
   }catch(err){
     loading.remove();
-    appendMessage("Network error — please check your connection and try again.", "bot");
+
+    const errorMsg = document.createElement("div");
+    errorMsg.className = "msg bot";
+    errorMsg.innerHTML = `
+      <strong>I'm unable to complete that right now.</strong><br><br>
+      Please check that the Flask server is running and try again.
+    `;
+    chatWindow.appendChild(errorMsg);
+    chatWindow.scrollTop = chatWindow.scrollHeight;
+
+  }finally{
+    setSendState(false);
+    chatInput.focus();
   }
 }
 
@@ -812,8 +1041,10 @@ askSend.onclick = () => {
   askInput.value = "";
   sendMessage(value);
 };
+
 askInput.addEventListener("keydown", e => {
-  if(e.key === "Enter"){
+  if(e.key === "Enter" && !e.shiftKey){
+    e.preventDefault();
     const value = askInput.value.trim();
     askInput.value = "";
     sendMessage(value);
@@ -825,8 +1056,10 @@ chatSend.onclick = () => {
   chatInput.value = "";
   sendMessage(value);
 };
+
 chatInput.addEventListener("keydown", e => {
-  if(e.key === "Enter"){
+  if(e.key === "Enter" && !e.shiftKey){
+    e.preventDefault();
     const value = chatInput.value.trim();
     chatInput.value = "";
     sendMessage(value);
@@ -834,13 +1067,17 @@ chatInput.addEventListener("keydown", e => {
 });
 
 document.getElementById("new-chat").onclick = () => {
+  conversation = [];
   chatWindow.innerHTML = "";
   chatLayout.classList.add("hidden");
   emptyState.classList.remove("hidden");
   askInput.focus();
 };
 
-document.getElementById("dashboard-ai").onclick = () => showView("assistant");
+document.getElementById("dashboard-ai").onclick = () => {
+  showView("assistant");
+  askInput.focus();
+};
 
 document.getElementById("share-btn").onclick = async () => {
   try{
@@ -857,14 +1094,18 @@ document.getElementById("dismiss-info").onclick = () => {
 
 document.getElementById("service-search").addEventListener("input", e => {
   const q = e.target.value.toLowerCase().trim();
+
   if(!q){
     renderServices(SERVICES);
     return;
   }
+
   showView("services");
+
   renderServices(SERVICES.filter(s =>
     `${s.name} ${s.category} ${s.description} ${s.keywords.join(" ")}`
-      .toLowerCase().includes(q)
+      .toLowerCase()
+      .includes(q)
   ));
 });
 </script>
@@ -898,9 +1139,20 @@ def get_services():
 def chat():
     data = request.get_json(force=True, silent=True) or {}
     user_message = (data.get("message") or "").strip()
+    history = data.get("history") or []
+
     if not user_message:
         return jsonify({"error": "message is required"}), 400
-    return jsonify({"response": ask_gemini(user_message)})
+
+    if not isinstance(history, list):
+        history = []
+
+    # Limit the amount of conversation sent to the model.
+    history = history[-8:]
+
+    return jsonify({
+        "response": ask_gemini(user_message, history)
+    })
 
 
 if __name__ == "__main__":
